@@ -1,0 +1,130 @@
+name: Hunan Watchdog
+# 兜底看门狗：心跳是链路主体，本工作流负责三件事——
+#   1) 取消卡死的运行（平台故障导致 job 超 timeout 仍 in_progress，占住并发组）；
+#   2) 数据过期且心跳链断掉时补触发抓取；
+#   3) 心跳不在跑时补发一个，保证自续链永续。
+# 本工作流不加入任何抓取并发组，即使某组被僵尸占住也能照常运行。
+#
+# 与 tariff 项目 watchdog 的差异：本项目四家抓取各自独立并发组，
+# 且心跳只驱动 mobile-build / unicom-fetch / telecom-gb-fetch 三个
+# （公告同步默认禁用），故这里对这三条链路做保活与补触发。
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 取消卡死的运行
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          CUTOFF=$(date -u -d '2 hours ago' +%s)
+          echo "截止时间: $(date -u -d @$CUTOFF +%FT%TZ) 之前启动的运行将被取消"
+
+          api() {
+            curl -fsSL --max-time 30 \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "User-Agent: hunan-watchdog" "$1"
+          }
+          cancel_stuck() {
+            local wf="$1" out
+            out=$(api "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?per_page=20") || return 0
+            printf '%s' "$out" | jq -r --argjson cutoff "$CUTOFF" \
+              '.workflow_runs[]
+               | select(.status == "in_progress" or .status == "queued" or .status == "waiting")
+               | select((.created_at | sub("\\.\\d+Z$"; "Z") | fromdateiso8601) < $cutoff)
+               | .id' \
+              | while read -r RUN_ID; do
+                  [ -n "$RUN_ID" ] || continue
+                  echo "取消卡死运行: $RUN_ID ($wf)"
+                  curl -fsS --max-time 30 -X POST \
+                    -H "Authorization: Bearer ${GH_TOKEN}" \
+                    -H "Accept: application/vnd.github+json" \
+                    -H "User-Agent: hunan-watchdog" \
+                    "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/cancel" || true
+                done
+          }
+          # 三家抓取单轮正常 10~80 分钟，超过 2 小时必然是平台侧僵尸。
+          for wf in mobile-build.yml unicom-fetch.yml telecom-gb-fetch.yml hunan-heartbeat.yml; do
+            cancel_stuck "$wf"
+          done
+          echo "卡死运行检查完成"
+
+      - name: 数据过期时补触发抓取
+        # 心跳断链时兜底：以线上 latest.json 的 updated 为准，超过阈值且
+        # 当前没有在跑/排队的抓取就补一次。阈值比心跳阈值略大，避免与心跳
+        # 正常节拍抢跑（心跳 100~120 分钟一更，这里 140/180 分钟才补）。
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          api() {
+            curl -fsSL --max-time 30 \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "User-Agent: hunan-watchdog" "$1"
+          }
+          check() {
+            local wf="$1" dir="$2" th="$3" u age active
+            u=$(curl -fsSL --max-time 20 -H 'Cache-Control: no-cache' \
+              "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/${dir}/data/latest.json?t=$(date +%s)" \
+              | jq -r '.updated // empty' 2>/dev/null) || u=""
+            if [ -z "$u" ]; then echo "[${dir}] 取不到 updated，跳过"; return 0; fi
+            age=$(( $(date -u +%s) - $(date -u -d "$u" +%s) ))
+            echo "[${dir}] 数据距今 $((age/60)) 分钟（阈值 $((th/60))）"
+            if [ "$age" -lt "$th" ]; then return 0; fi
+            active=$(api "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?per_page=5" \
+              | jq '[.workflow_runs[] | select(.status == "in_progress" or .status == "queued" or .status == "waiting")] | length' 2>/dev/null) || active=1
+            if [ "$active" != "0" ]; then
+              echo "[${dir}] 有 $active 个运行在进行/排队，不重复触发"
+              return 0
+            fi
+            echo "::warning::[${dir}] 数据已过期 $((age/3600)) 小时，补触发 ${wf}"
+            curl -fsS --max-time 30 -X POST \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "User-Agent: hunan-watchdog" \
+              -H "Content-Type: application/json" -d '{"ref":"main"}' \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/dispatches" \
+              || echo "[${dir}] 触发失败"
+          }
+          check mobile-build.yml data 8400
+          check unicom-fetch.yml unicom 10800
+          check telecom-gb-fetch.yml telecom 10800
+          echo "三家数据检查完成"
+
+      - name: 心跳保活
+        # hunan-heartbeat 靠自续期运行，链路一旦断掉就没人叫醒它。
+        # 看门狗每 15 分钟检查一次，没有任何在跑/排队的心跳就补发一个。
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          ACTIVE=$(curl -fsSL --max-time 30 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "User-Agent: hunan-watchdog" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/hunan-heartbeat.yml/runs?per_page=5" \
+            | jq '[.workflow_runs[] | select(.status == "in_progress" or .status == "queued" or .status == "waiting")] | length' 2>/dev/null) || ACTIVE=1
+          if [ "$ACTIVE" = "0" ]; then
+            echo "心跳不在运行，补发一个 hunan-heartbeat"
+            curl -fsS --max-time 30 -X POST \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "User-Agent: hunan-watchdog" \
+              -H "Content-Type: application/json" -d '{"ref":"main"}' \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/hunan-heartbeat.yml/dispatches" \
+              || echo "::warning::补发心跳失败"
+          else
+            echo "心跳在运行（$ACTIVE）"
+          fi

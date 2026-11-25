@@ -1,0 +1,203 @@
+name: Hunan Heartbeat
+# 自续心跳：绕开 GitHub schedule 对 fork 的丢触发/延迟。
+# 本项目实测：fork 创建至今所有抓取运行均为手动（workflow_dispatch），
+# schedule 定时触发 = 0 次，只靠 cron 不可靠。
+#
+# 机制：单个长驻 job 内循环——按各站 data/latest.json 的 updated 判断数据
+# 是否够旧，够旧且该管线没有运行/排队就 dispatch 一轮抓取，跑完继续等下一轮。
+# 运行接近 100 分钟预算时用 workflow_dispatch 续期一个新心跳运行
+# （GITHUB_TOKEN 触发的运行不会产生可级联的 workflow_run，只有 dispatch 例外），
+# 循环永续。链路中断由 hunan-watchdog 看门狗兜底。
+#
+# 与 tariff 项目的区别：本项目四家抓取各自独立并发组
+# （tariff-build / unicom-fetch / telecom-gb-fetch / announce-sync），
+# 不存在主站派发子站机制，所以心跳直接驱动每个抓取工作流，而不是只驱动主站。
+# 电信与广电共用 telecom-gb-fetch.yml，用两者中较旧的数据判断。
+#
+# 数据 updated 格式为 "YYYY-MM-DD HH:MM:SS"（UTC，无 Z 后缀），date -u -d 可直接解析。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+concurrency:
+  group: hunan-heartbeat
+  # 新心跳启动时旧心跳可能仍在收尾，直接取消，新心跳已接管循环
+  cancel-in-progress: true
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    # 长驻 job 卡死会永久占用 runner 与并发组，缩到 120 分钟；
+    # 脚本内 100 分钟预算到期会自己收尾并续期，不会触发平台超时。
+    timeout-minutes: 120
+    steps:
+      - name: 循环驱动四站抓取
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 数据达到多少秒旧就触发下一轮。100 分钟 ≈ 每 1.5~2 小时一更
+          # （抓取本身约需 10~30 分钟，构建完数据刷新，故实际间隔约 2 小时）
+          TH_MOBILE: "6000"
+          TH_UNICOM: "7200"
+          TH_TELECOM: "7200"
+          TH_GB: "7200"
+          TH_ANNOUNCE: "3600"
+        run: |
+          set -e
+          DEADLINE=$(( $(date -u +%s) + 100 * 60 ))
+          MIN_GAP=900
+          LAST_DISPATCH=0
+
+          # 统一用 curl + GITHUB_TOKEN（不依赖 gh；runner 上 gh 曾整体失败
+          # 且错误被 2>/dev/null 吞掉，导致心跳误判「有运行」而空转）。
+          api() {
+            local url="$1" i out
+            for i in 1 2 3; do
+              if out=$(curl -fsSL --max-time 30 \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "User-Agent: hunan-heartbeat" "$url" 2>/tmp/hb_api_err); then
+                printf '%s' "$out"; return 0
+              fi
+              echo "[warn] API 失败（$i/3）：$(head -c 120 /tmp/hb_api_err)" >&2
+              sleep 10
+            done
+            return 1
+          }
+
+          api_post() {
+            local url="$1" i
+            for i in 1 2 3; do
+              if curl -fsS --max-time 30 -X POST \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "User-Agent: hunan-heartbeat" \
+                -H "Content-Type: application/json" \
+                -d '{"ref":"main"}' "$url" >/dev/null 2>/tmp/hb_api_err; then
+                return 0
+              fi
+              echo "[warn] 派发失败（$i/3）：$(head -c 120 /tmp/hb_api_err)" >&2
+              sleep 10
+            done
+            return 1
+          }
+
+          # EXIT trap 兜底续期：中途任何一次 API 失败被 set -e 终止时也能续上，
+          # 避免心跳链彻底断掉（tariff 项目曾因此断链 4 小时）。
+          RENEWED=0
+          renew() {
+            [ "$RENEWED" = "1" ] && return 0
+            RENEWED=1
+            # 已有别的心跳在运行/排队时不再派一个：workflow_dispatch 与看门狗
+            # 可能同秒撞车。排除自身，避免自我否决。
+            local n
+            n=$(api "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/hunan-heartbeat.yml/runs?per_page=10" 2>/dev/null \
+              | jq --argjson self "$GITHUB_RUN_ID" \
+              '[.workflow_runs[] | select(.id != $self) | select(.status == "in_progress" or .status == "queued" or .status == "waiting")] | length' 2>/dev/null || echo 0)
+            if [ "${n:-0}" != "0" ]; then
+              echo "已有 $n 个心跳在运行/排队，跳过续期"
+              return 0
+            fi
+            if api_post "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/hunan-heartbeat.yml/dispatches"; then
+              echo "已续期新心跳 $(date -u +%FT%TZ)"
+            else
+              echo "::warning::心跳续期失败，等待 hunan-watchdog 兜底"
+            fi
+          }
+          trap renew EXIT
+
+          # 线上数据的 updated 距今秒数；取不到按已过期处理
+          data_age() {
+            local u t
+            u=$(curl -fsSL --max-time 20 -H 'Cache-Control: no-cache' \
+              "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/$1?t=$(date +%s)" \
+              | jq -r '.updated // empty' 2>/dev/null) || u=""
+            [ -n "$u" ] || { echo 999999; return 0; }
+            t=$(date -u -d "$u" +%s 2>/dev/null) || { echo 999999; return 0; }
+            echo $(( $(date -u +%s) - t ))
+          }
+
+          # 某工作流在运行/排队的数量；取不到时按 0 处理（宁可多触发一次，
+          # 由各站并发组与数据阈值兜住，心跳不能因此永远空转）
+          count_active() {
+            local out n
+            out=$(api "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/$1/runs?per_page=5") || { echo 0; return 0; }
+            n=$(printf '%s' "$out" | jq '[.workflow_runs[] | select(.status == "in_progress" or .status == "queued" or .status == "waiting")] | length' 2>/dev/null) || n=0
+            echo "$n"
+          }
+
+          dispatch() {
+            if api_post "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/$1/dispatches" >/dev/null; then
+              echo "已触发 $1 $(date -u +%FT%TZ)"
+              return 0
+            fi
+            echo "::warning::触发 $1 失败，等下一轮循环或看门狗补上"
+            return 1
+          }
+
+          # 数据够旧 + 无运行 + 距上次派发超过 MIN_GAP 时，触发一轮抓取
+          check_and_dispatch() {
+            local wf="$1" age="$2" th="$3" label="$4" active
+            if [ "$age" -lt "$th" ]; then
+              echo "[$label] 数据距今 $((age/60)) 分钟（阈值 $((th/60))），无需触发"
+              return 0
+            fi
+            active=$(count_active "$wf")
+            if [ "$active" != "0" ]; then
+              echo "[$label] 有 $active 个运行在进行/排队，跳过"
+              return 0
+            fi
+            if [ $(( $(date -u +%s) - LAST_DISPATCH )) -lt "$MIN_GAP" ]; then
+              echo "[$label] 距上次派发不足 $((MIN_GAP/60)) 分钟，稍后再试"
+              return 0
+            fi
+            if dispatch "$wf"; then
+              LAST_DISPATCH=$(date -u +%s)
+              DISPATCHED=1
+            fi
+          }
+
+          ALL_WF="mobile-build.yml unicom-fetch.yml telecom-gb-fetch.yml"
+
+          while :; do
+            LEFT=$(( DEADLINE - $(date -u +%s) ))
+            [ "$LEFT" -le 0 ] && break
+            DISPATCHED=0
+
+            check_and_dispatch mobile-build.yml "$(data_age data/latest.json)" "$TH_MOBILE" "主站移动"
+            check_and_dispatch unicom-fetch.yml "$(data_age unicom/data/latest.json)" "$TH_UNICOM" "联通"
+
+            # 电信与广电共用 telecom-gb-fetch.yml，取两者中较旧的数据判断
+            AGE_T=$(data_age telecom/data/latest.json)
+            AGE_G=$(data_age gb/data/latest.json)
+            if [ "$AGE_T" -ge "$AGE_G" ]; then OPS_AGE=$AGE_T; else OPS_AGE=$AGE_G; fi
+            check_and_dispatch telecom-gb-fetch.yml "$OPS_AGE" "$TH_TELECOM" "电信+广电"
+
+            # 公告同步：默认不纳入心跳（Announce Sync 当前为 disabled_fork，
+            # 需先在 Actions 页启用）。若已启用且希望纳入，取消下面两行注释：
+            # ANNOUNCE_AGE=$(data_age data/announce.json)
+            # check_and_dispatch announce-sync.yml "$ANNOUNCE_AGE" "$TH_ANNOUNCE" "公告"
+
+            if [ "$DISPATCHED" = "1" ]; then
+              # 等本轮派发的抓取结束再继续判断，避免重复派发
+              while [ "$(date -u +%s)" -lt "$DEADLINE" ]; do
+                sleep 60
+                ACTIVE=0
+                for wf in $ALL_WF; do
+                  a=$(count_active "$wf")
+                  [ "$a" = "0" ] || ACTIVE=1
+                done
+                [ "$ACTIVE" = "0" ] && break
+              done
+              echo "本轮抓取已结束 $(date -u +%FT%TZ)"
+            fi
+
+            SLEEP=$(( LEFT < 300 ? LEFT : 300 ))
+            echo "=== 睡眠 $((SLEEP/60)) 分钟至 $(date -u -d "+$SLEEP seconds" +%FT%TZ) ==="
+            sleep "$SLEEP"
+          done
+
+          echo "时间预算用尽 $(date -u +%FT%TZ)"
+          renew
