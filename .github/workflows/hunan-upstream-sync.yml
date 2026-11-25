@@ -1,0 +1,156 @@
+name: Upstream Sync
+
+# 保守白名单同步：每 10 分钟轮询上游，只同步核心源码/UI/核心工作流。
+# 本项目上游处于调试状态（大量 probe 探针、数据曾被并发写空），
+# 故刻意不同步：data/、snapshots/、probe/、logs/、调试输出、源码包 zip，
+# 也不同步 zz-*/dns-*/cf-* 等诊断工作流，避免把上游的调试垃圾带进 fork。
+# index.html 由 fork 本地维护（有本地改动），不同步以免被覆盖。
+# fork 中新加的工作流默认 disabled_fork，上传后需在 Actions 页面点 Enable workflow。
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          # 若希望同步提交触发 fork 内的 zip-sync 等工作流，配置 PAT 为 SYNC_TOKEN；
+          # 不配置则用 GITHUB_TOKEN，同步提交不会触发其他 workflow。
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Sync core source from upstream
+        env:
+          UPSTREAM_REPO: https://github.com/WoShiYiGeManHuaJia/hunan-tariff-site.git
+        run: |
+          set -euo pipefail
+          git config user.name "tariff-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch --depth=1 upstream main
+          UPSTREAM_SHA=$(git rev-parse FETCH_HEAD)
+          echo "upstream main = ${UPSTREAM_SHA}"
+
+          # 只同步这些核心路径。工作流用具体文件白名单，避免把上游
+          # 100+ 个 probe/diag/zz-* 调试工作流同步进来。
+          SYNC_PATHS=(
+            ".github/workflows/mobile-build.yml"
+            ".github/workflows/dingtalk-summary.yml"
+            ".github/workflows/announce-sync.yml"
+            ".github/workflows/telecom-gb-fetch.yml"
+            ".github/workflows/telecom-announce.yml"
+            ".github/workflows/unicom-fetch.yml"
+            ".github/workflows/zip-sync.yml"
+            "scripts"
+            "pipelines"
+            "icons"
+            "tools"
+            "tests"
+            "functions"
+            "nav.html"
+            "push-center.html"
+            "app.html"
+            "app.js"
+            "common-extras.js"
+            "style.css"
+            "sw.js"
+            "gb.html"
+            "telecom.html"
+            "unicom.html"
+            "manifest.json"
+            "logo.png"
+            "_headers"
+            "_anchor.js"
+            "_pv2.js"
+            ".env.example"
+            ".gitignore"
+            ".nojekyll"
+            "README.md"
+            "NOTIFY_SETUP.md"
+            "DINGTALK_SETUP.md"
+            "SHORT.md"
+            "SHORT2.md"
+            "SHORT_URL.md"
+            "VERIFY.md"
+            "requirements.txt"
+            "version.json"
+            "backfill_history.py"
+            "check.py"
+            "clean_fake_added.py"
+          )
+
+          # 排除：
+          #   - 本工作流自身（上游没有它）
+          #   - 数据产物 / 快照（由 fork 自己的抓取任务生成）
+          #   - probe/ 与 logs/（上游调试遗留，305+ 文件）
+          #   - pipelines 内嵌的 data/ 与 snapshots/
+          #   - fork 本地维护的 index.html
+          CHANGED=$(git diff --name-only HEAD FETCH_HEAD -- "${SYNC_PATHS[@]}" \
+            | grep -vE '^pipelines/mobile/snapshots/|^pipelines/site/data/|^pipelines/unicom/data/|^data/|^probe/|^_probe/|^logs/|^index.html$|^.github/workflows/upstream-sync.yml$|^.github/workflows/hunan-upstream-sync.yml$' \
+            || true)
+
+          if [ -z "${CHANGED}" ]; then
+            echo "No core source changes from upstream."
+            exit 0
+          fi
+
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            if git cat-file -e "FETCH_HEAD:${path}" 2>/dev/null; then
+              git checkout FETCH_HEAD -- "$path"
+            else
+              git rm -q --ignore-unmatch -- "$path"
+            fi
+          done <<< "${CHANGED}"
+
+          git add -A -- "${SYNC_PATHS[@]}"
+
+          # 兜底：绝不暂存任何数据产物 / 调试输出 / 源码包。
+          BAD=$(git diff --cached --name-only \
+            | grep -E '(^data/|/snapshots/|/data/|^probe/|^_probe/|^logs/|^index.html$|\.txt$|^tariff-fetch-source\.zip$)' \
+            || true)
+          if [ -n "${BAD}" ]; then
+            echo "::error::Refusing to stage generated/debug files:"
+            echo "${BAD}"
+            exit 1
+          fi
+
+          if git diff --cached --quiet; then
+            echo "No effective changes."
+            exit 0
+          fi
+
+          git commit -q -m "chore: sync core source from WoShiYiGeManHuaJia/hunan-tariff-site@${UPSTREAM_SHA:0:7}"
+
+          # fork 自己的抓取任务可能同时推送数据提交，失败时重新对齐后重试。
+          PUSHED=0
+          for i in 1 2 3 4 5; do
+            if git push origin HEAD:main; then
+              PUSHED=1
+              break
+            fi
+            echo "[warn] push failed, rebase and retry ($i/5)"
+            git fetch --depth=1 origin main
+            if ! git rebase origin/main; then
+              git rebase --abort || true
+              echo "::error::Rebase conflict, please resolve manually."
+              exit 1
+            fi
+          done
+          [ "${PUSHED}" -eq 1 ] || { echo "::error::push failed after 5 retries"; exit 1; }
+
+          echo "Synced core source from upstream ${UPSTREAM_SHA:0:7}" >> "$GITHUB_STEP_SUMMARY"
