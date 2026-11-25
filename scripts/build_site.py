@@ -46,8 +46,8 @@ SECTION_NAMES = {
     "xinjiang": "新疆",
 }
 
-# 展示站默认选中的省份（前端记忆用户选择，首次访问用此值）
-DEFAULT_PROV = "hunan"
+# 展示站默认选中的省份（前端记忆用户选择，首次访问用此值）  # fork 本地定制：默认甘肃（由 upstream-sync 排除保护）
+DEFAULT_PROV = "gansu"
 
 
 def sec_name(sec):
