@@ -1,5 +1,6 @@
 name: Unicom Fetch
 # 公开仓 Actions 免费不限量（私有仓额度已耗尽）
+# re-register workflow
 
 on:
   schedule:
