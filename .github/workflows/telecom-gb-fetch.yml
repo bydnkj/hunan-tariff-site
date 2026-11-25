@@ -1,6 +1,7 @@
 name: Telecom & GB Fetch
 # 公开仓 Actions 免费不限量（私有仓额度已耗尽）
 # 单 job 顺序执行：电信 → 广电 → 统一提交，避免并行 push 冲突
+# re-register workflow
 
 on:
   schedule:
