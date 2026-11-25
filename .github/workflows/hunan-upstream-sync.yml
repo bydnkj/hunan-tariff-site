@@ -99,8 +99,9 @@ jobs:
           #   - probe/ 与 logs/（上游调试遗留，305+ 文件）
           #   - pipelines 内嵌的 data/ 与 snapshots/
           #   - fork 本地维护的 index.html
+          #   - fork 本地定制的默认省份脚本（默认甘肃），避免同步回退为湖南
           CHANGED=$(git diff --name-only HEAD FETCH_HEAD -- "${SYNC_PATHS[@]}" \
-            | grep -vE '^pipelines/mobile/snapshots/|^pipelines/site/data/|^pipelines/unicom/data/|^data/|^probe/|^_probe/|^logs/|^index.html$|^.github/workflows/upstream-sync.yml$|^.github/workflows/hunan-upstream-sync.yml$' \
+            | grep -vE '^pipelines/mobile/snapshots/|^pipelines/site/data/|^pipelines/unicom/data/|^data/|^probe/|^_probe/|^logs/|^index.html$|^.github/workflows/upstream-sync.yml$|^.github/workflows/hunan-upstream-sync.yml$|^scripts/build_site\.py$|^pipelines/unicom_pipeline\.py$|^pipelines/gb_pipeline\.py$|^pipelines/telecom_pipeline\.py$' \
             || true)
 
           if [ -z "${CHANGED}" ]; then
