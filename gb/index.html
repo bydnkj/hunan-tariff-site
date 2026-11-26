@@ -2035,7 +2035,7 @@ function renderAnnounce(){
   var box = document.getElementById("anBox"), desc = document.getElementById("anDesc");
   var op = OP_MAP[state.op];
   document.getElementById("anTitle").textContent = hasData() ? "中国广电公告" : (op.name + "公告");
-  document.getElementById("anTabTxt").textContent = hasData() ? "中国广电公告" : (op.short + "公告");
+  document.getElementById("anTabTxt").textContent = hasData() ? "广电公告" : (op.short + "公告");
   if(!hasData()){
     desc.textContent = "暂无接入";
     box.innerHTML = emptyBox(op.name + "公告源待接入");
