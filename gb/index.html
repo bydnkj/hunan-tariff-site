@@ -2034,14 +2034,14 @@ function renderAnnounce(){
   var a = D.announce || {};
   var box = document.getElementById("anBox"), desc = document.getElementById("anDesc");
   var op = OP_MAP[state.op];
-  document.getElementById("anTitle").textContent = hasData() ? "湖南移动公告" : (op.name + "公告");
-  document.getElementById("anTabTxt").textContent = hasData() ? "湖南公告" : (op.short + "公告");
+  document.getElementById("anTitle").textContent = hasData() ? "中国广电公告" : (op.name + "公告");
+  document.getElementById("anTabTxt").textContent = hasData() ? "中国广电公告" : (op.short + "公告");
   if(!hasData()){
     desc.textContent = "暂无接入";
     box.innerHTML = emptyBox(op.name + "公告源待接入");
     return;
   }
-  desc.textContent = "来源：湖南移动官网公告 · 更新于 " + (a.updated || "—");
+  desc.textContent = "来源：中国广电官网公告 · 更新于 " + (a.updated || "—");
   var items = a.items || [];
   if(!items.length){ box.innerHTML = '<div style="color:var(--tx3);font-size:13px">暂无公告</div>'; return; }
   box.innerHTML = items.map(function(x, i){
